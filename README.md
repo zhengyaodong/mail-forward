@@ -1,6 +1,6 @@
 # mail-forward
 
-本项目用于**每隔 1 小时读取学校邮箱的新邮件，并自动转发到另一个邮箱**。
+本项目用于**每隔 1 小时（可配置）读取学校邮箱的新邮件，并自动转发到另一个邮箱**。
 
 ## 你需要准备什么
 
@@ -26,7 +26,7 @@ python -m pip install -r requirements.txt
   - `SRC_EMAIL` / `SRC_PASSWORD`：学校邮箱账号与密码（或授权码）
   - `IMAP_HOST`：学校邮箱 IMAP 服务器地址（不确定就问学校/查学校邮箱帮助文档）
   - `SMTP_*`：用于“发出转发邮件”的 SMTP（如果用 QQ 发信，这里就填 QQ 的 SMTP）
-  - `DEST_EMAIL=283406@qq.com`
+  - `DEST_EMAIL=****@qq.com`
 
 4) 运行一次（测试）
 
@@ -59,3 +59,27 @@ python forwarder.py
 - `SMTP_USER` 填你的 QQ 邮箱
 - `SMTP_PASSWORD` 填授权码（不是 QQ 登录密码）
 
+## 设置 GitHub Secrets ： 
+
+- 进入 GitHub 仓库的 Settings > Secrets and variables > Actions
+- 添加以下 secrets（根据您的实际配置填写）：
+- SRC_EMAIL ：源邮箱地址
+- SRC_PASSWORD ：源邮箱密码
+- IMAP_HOST ：IMAP 服务器地址（如 mail.gzus.edu.cn）
+- IMAP_PORT ：IMAP 端口（默认 993）
+- IMAP_SSL ：是否使用 SSL（默认 true）
+- IMAP_FOLDER ：邮箱文件夹（默认 INBOX）
+- SMTP_USER ：SMTP 用户名
+- SMTP_PASSWORD ：SMTP 密码
+- SMTP_HOST ：SMTP 服务器地址
+- SMTP_PORT ：SMTP 端口
+- SMTP_SSL ：是否使用 SSL
+- DEST_EMAIL ：目标邮箱地址
+- POLL_INTERVAL_SECONDS：时间间隔
+
+### 工作流说明 ：
+- 工作流会在代码推送到 main 分支时运行
+- 也会每 6 小时自动运行一次（通过 cron 调度）
+- 使用 Ubuntu 最新版本作为运行环境
+- 设置 Python 3.12
+- 安装依赖并运行邮件转发脚本
