@@ -300,6 +300,65 @@ def _uids_to_process(imap: imaplib.IMAP4, folder: str, last_uid: Optional[int]) 
 #                 raw_body = part[1]
     
 #     return raw_header, raw_body
+def _build_forward_message_no_attachment(
+    cfg: Config,
+    raw_header: bytes,
+    raw_body: bytes,
+    original_uid: str,
+) -> EmailMessage:
+    """构造转发邮件，只包含头部和正文文本，不包含附件"""
+    # 解析头部
+    header_msg = message_from_bytes(raw_header, policy=default)
+    subject = decode_str(header_msg.get('Subject'))
+    from_info = decode_str(header_msg.get('From'))
+
+    # 解析正文
+    temp_msg = message_from_bytes(raw_body, policy=default)
+    body_part = temp_msg.get_body(preferencelist=('html', 'plain'))
+    
+    body_content = ""
+    is_html = False
+    if body_part:
+        body_content = body_part.get_content()
+        is_html = (body_part.get_content_type() == 'text/html')
+    else:
+        body_content = "（无法解析正文内容，请登录网页版查看）"
+
+    # 构造新邮件
+    forward_msg = EmailMessage()
+    forward_msg['Subject'] = f"[通知正文] {subject}"
+    forward_msg['From'] = cfg.smtp_user
+    forward_msg['To'] = cfg.dest_email
+    
+    notice = "--- 学校邮箱转发 (已自动忽略附件以防断连) ---\n" + "发件人: " + from_info + "\n" + "主题: " + subject + "\n\n"
+    
+    if is_html:
+        header_html = "<div style='background:#f9f9f9;padding:10px;border:1px solid #eee'><b>发件人:</b> " + from_info + "<br><b>主题:</b> " + subject + "<br><i>[提示] 附件已忽略，请至学校邮箱下载</i></div><br>"
+        forward_msg.add_alternative(header_html + body_content, subtype='html')
+    else:
+        forward_msg.set_content(notice + body_content)
+    
+    return forward_msg
+
+
+def _imap_fetch_header_and_text(imap: imaplib.IMAP4, uid: int) -> tuple[bytes, bytes]:
+    """只获取邮件头部和正文文本，不获取附件"""
+    typ, data = imap.uid("fetch", str(uid), "(BODY.PEEK[HEADER] BODY.PEEK[TEXT])")
+    if typ != "OK":
+        raise RuntimeError(f"IMAP fetch failed for uid={uid}: {(typ, data)}")
+    
+    raw_header = b""
+    raw_body = b""
+    for part in data:
+        if isinstance(part, tuple):
+            if b'HEADER' in part[0]:
+                raw_header = part[1]
+            elif b'TEXT' in part[0]:
+                raw_body = part[1]
+    
+    return raw_header, raw_body
+
+
 def _imap_fetch_full_message(imap: imaplib.IMAP4, uid: int) -> bytes:
     """获取完整邮件内容（包含附件）"""
     # RFC822 代表获取邮件的原始完整数据
@@ -374,18 +433,94 @@ def process_once(cfg: Config) -> int:
                     logging.info("Forwarded uid=%s (attempt %d)", uid, attempts)
                     success = True
                 except imaplib.IMAP4.abort as e:
-                    logging.warning("IMAP aborted on uid=%s attempt=%d: %s", uid, attempts, e)
-                    try:
-                        imap.logout()
-                    except Exception:
-                        pass
-                    imap = imap_connect(cfg)
-                    imap.login(cfg.src_email, cfg.src_password)
-                    _ensure_selected(imap, cfg.imap_folder)
-                    time.sleep(1)
+                    logging.warning("IMAP aborted on uid=%s with attachments attempt=%d: %s", uid, attempts, e)
+                    
+                    # 如果是第一次失败，尝试降级处理：只转发标题和正文
+                    if attempts == 1:
+                        logging.info("Attempting to forward without attachments for uid=%s", uid)
+                        try:
+                            # 重新连接 IMAP
+                            try:
+                                imap.logout()
+                            except Exception:
+                                pass
+                            imap = imap_connect(cfg)
+                            imap.login(cfg.src_email, cfg.src_password)
+                            _ensure_selected(imap, cfg.imap_folder)
+                            
+                            # 获取邮件头部和正文文本
+                            raw_header, raw_body = _imap_fetch_header_and_text(imap, uid)
+                            
+                            # 重新连接 SMTP
+                            try:
+                                smtp.quit()
+                            except Exception:
+                                pass
+                            smtp = smtp_connect(cfg)
+                            smtp.login(cfg.smtp_user, cfg.smtp_password)
+                            
+                            # 构造无附件的转发邮件
+                            fwd = _build_forward_message_no_attachment(cfg, raw_header, raw_body, original_uid=str(uid))
+                            
+                            # 发送邮件
+                            smtp.send_message(fwd)
+                            
+                            # 成功后标记为已读
+                            _imap_mark_forwarded(imap, uid)
+                            forwarded += 1
+
+                            if last_uid_int is None or uid > last_uid_int:
+                                last_uid_int = uid
+                                state[state_key] = last_uid_int
+                                save_state(state)
+
+                            logging.info("Forwarded uid=%s without attachments (attempt %d)", uid, attempts)
+                            success = True
+                        except Exception as e2:
+                            logging.exception("Failed forwarding uid=%s without attachments: %s", uid, e2)
+                            time.sleep(1)
+                    else:
+                        # 重新连接 IMAP
+                        try:
+                            imap.logout()
+                        except Exception:
+                            pass
+                        imap = imap_connect(cfg)
+                        imap.login(cfg.src_email, cfg.src_password)
+                        _ensure_selected(imap, cfg.imap_folder)
+                        time.sleep(1)
                 except Exception as e:
-                    logging.exception("Failed forwarding uid=%s attempt=%d: %s", uid, attempts, e)
-                    time.sleep(1)
+                    logging.exception("Failed forwarding uid=%s with attachments attempt=%d: %s", uid, attempts, e)
+                    
+                    # 如果是第一次失败，尝试降级处理：只转发标题和正文
+                    if attempts == 1:
+                        logging.info("Attempting to forward without attachments for uid=%s", uid)
+                        try:
+                            # 获取邮件头部和正文文本
+                            raw_header, raw_body = _imap_fetch_header_and_text(imap, uid)
+                            
+                            # 构造无附件的转发邮件
+                            fwd = _build_forward_message_no_attachment(cfg, raw_header, raw_body, original_uid=str(uid))
+                            
+                            # 发送邮件
+                            smtp.send_message(fwd)
+                            
+                            # 成功后标记为已读
+                            _imap_mark_forwarded(imap, uid)
+                            forwarded += 1
+
+                            if last_uid_int is None or uid > last_uid_int:
+                                last_uid_int = uid
+                                state[state_key] = last_uid_int
+                                save_state(state)
+
+                            logging.info("Forwarded uid=%s without attachments (attempt %d)", uid, attempts)
+                            success = True
+                        except Exception as e2:
+                            logging.exception("Failed forwarding uid=%s without attachments: %s", uid, e2)
+                            time.sleep(1)
+                    else:
+                        time.sleep(1)
 
             if not success:
                 # Skip this UID to avoid blocking subsequent messages
